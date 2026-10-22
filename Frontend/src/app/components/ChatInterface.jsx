@@ -181,7 +181,7 @@ export default function ChatInterface() {
 
     try {
       const response = await axios.post(
-        "http://localhost:3000/invoke",
+        "https://langgraph-battle-ai-arena-4id8.onrender.com/invoke",
         { input: problem },
         { timeout: 120000 }
       );
@@ -203,13 +203,13 @@ export default function ChatInterface() {
         previous.map((message) =>
           message.id === messageId
             ? {
-                id: messageId,
-                problem,
-                solution_1: result.solution_1,
-                solution_2: result.solution_2,
-                judge: result.judge,
-                status: "complete",
-              }
+              id: messageId,
+              problem,
+              solution_1: result.solution_1,
+              solution_2: result.solution_2,
+              judge: result.judge,
+              status: "complete",
+            }
             : message
         )
       );
@@ -232,7 +232,7 @@ export default function ChatInterface() {
             : error.message === "Network Error"
               ? "Connection failed. Check that the backend is running."
               : error.message ||
-                "Something went wrong. Please try again.");
+              "Something went wrong. Please try again.");
 
       setMessages((previous) =>
         previous.filter((item) => item.id !== messageId)
