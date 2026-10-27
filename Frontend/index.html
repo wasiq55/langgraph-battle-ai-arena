@@ -5,16 +5,37 @@
   <meta charset="UTF-8" />
 
   <link rel="icon" type="image/png" href="%BASE_URL%favicon.png" />
+
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="theme-color" content="#09090b" />
   <meta name="description"
     content="LangGraph Battle AI Arena — compare AI models, evaluate their answers, and discover the winning solution." />
+
   <title>LangGraph Battle AI Arena</title>
 </head>
 
 <body>
   <div id="root"></div>
+
+  <script>
+    (function () {
+      const params = new URLSearchParams(window.location.search);
+      const route = params.get("p");
+
+      if (route !== null) {
+        const base = "/langgraph-battle-ai-arena";
+        window.history.replaceState(
+          null,
+          "",
+          base + route + window.location.hash
+        );
+      }
+    })();
+  </script>
+
+
   <script type="module" src="/src/main.jsx"></script>
+
 </body>
 
 </html>
