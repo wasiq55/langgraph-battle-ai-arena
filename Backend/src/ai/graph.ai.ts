@@ -3,8 +3,7 @@ import {
   StateGraph,
   StateSchema,
   START,
-  END,
-  type GraphNode,
+  END
 } from "@langchain/langgraph";
 import { z } from "zod";
 import { groqModel, cohereModel, judgeModel } from "./model.ai.js";
@@ -13,7 +12,7 @@ const judgeSchema = z.object({
   solution_1_score: z.coerce.number().min(0).max(10),
   solution_2_score: z.coerce.number().min(0).max(10),
   solution_1_reasoning: z.string().min(1),
-  solution_2_reasoning: z.string().min(1),
+  solution_2_reasoning: z.string().min(1)
 });
 
 const state = new StateSchema({
@@ -24,28 +23,29 @@ const state = new StateSchema({
     solution_1_score: z.number().default(0),
     solution_2_score: z.number().default(0),
     solution_1_reasoning: z.string().default(""),
-    solution_2_reasoning: z.string().default(""),
-  }),
+    solution_2_reasoning: z.string().default("")
+  })
 });
 
-const solutionNode: GraphNode<typeof state> = async (state) => {
-  const [groqResponse, cohereResponse] = await Promise.all([
-    groqModel.invoke(state.problem),
-    cohereModel.invoke(state.problem),
-  ]);
+function getText(content) {
+  if (typeof content === "string") {
+    return content;
+  }
 
-  return {
-    solution_1: String(groqResponse.content),
-    solution_2: String(cohereResponse.content),
-  };
-};
+  if (Array.isArray(content)) {
+    return content
+      .map(part => {
+        if (typeof part === "string") return part;
+        return typeof part?.text === "string" ? part.text : "";
+      })
+      .join("");
+  }
 
-const judgeNode: GraphNode<typeof state> = async (state) => {
-  const { problem, solution_1, solution_2 } = state;
+  return content == null ? "" : String(content);
+}
 
-  const judge = judgeModel.withStructuredOutput(judgeSchema);
-
-  const prompt = `
+function createJudgePrompt(problem, solution_1, solution_2) {
+  return `
 You are an impartial AI judge evaluating two AI-generated solutions.
 
 Evaluate both solutions based on:
@@ -70,12 +70,16 @@ ${solution_1}
 Solution 2 (Cohere):
 ${solution_2}
 `;
+}
 
-  let lastError: unknown;
+async function evaluateJudge(problem, solution_1, solution_2) {
+  const judge = judgeModel.withStructuredOutput(judgeSchema);
+  const prompt = createJudgePrompt(problem, solution_1, solution_2);
+  let lastError;
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const judgeResponse = await judge.invoke(
+      const response = await judge.invoke(
         attempt === 1
           ? prompt
           : `${prompt}
@@ -84,30 +88,46 @@ Your previous response failed validation.
 Return both scores as numbers from 0 to 10 and provide non-empty explanations for both solutions.`
       );
 
-      const validated = judgeSchema.safeParse(judgeResponse);
+      const validated = judgeSchema.safeParse(response);
 
       if (!validated.success) {
-        throw new Error(
-          `Invalid judge response: ${validated.error.message}`
-        );
+        throw new Error(`Invalid judge response: ${validated.error.message}`);
       }
 
-      return {
-        judge: validated.data,
-      };
+      return validated.data;
     } catch (error) {
       lastError = error;
-      console.error(`OpenRouter judge attempt ${attempt} failed:`, error);
+      console.error(`Judge attempt ${attempt} failed:`, error);
     }
   }
 
   throw new Error(
-    `OpenRouter judge failed after 3 attempts: ${
-      lastError instanceof Error
-        ? lastError.message
-        : "Unknown judge error"
+    `Judge failed after 3 attempts: ${
+      lastError instanceof Error ? lastError.message : "Unknown judge error"
     }`
   );
+}
+
+const solutionNode = async graphState => {
+  const [groqResponse, cohereResponse] = await Promise.all([
+    groqModel.invoke(graphState.problem),
+    cohereModel.invoke(graphState.problem)
+  ]);
+
+  return {
+    solution_1: getText(groqResponse.content),
+    solution_2: getText(cohereResponse.content)
+  };
+};
+
+const judgeNode = async graphState => {
+  const judge = await evaluateJudge(
+    graphState.problem,
+    graphState.solution_1,
+    graphState.solution_2
+  );
+
+  return { judge };
 };
 
 const graph = new StateGraph(state)
@@ -118,7 +138,69 @@ const graph = new StateGraph(state)
   .addEdge("judge_node", END)
   .compile();
 
-export default async function runGraph(problem: string) {
-  const result = await graph.invoke({ problem });
+export default async function runGraph(problem) {
+  return await graph.invoke({ problem });
+}
+
+export async function runGraphStream(problem, emit) {
+  let solution_1 = "";
+  let solution_2 = "";
+
+  async function streamSolution(model, solutionKey) {
+    let answer = "";
+    const stream = await model.stream(problem);
+
+    for await (const chunk of stream) {
+      const text = getText(chunk.content);
+
+      if (!text) continue;
+
+      answer += text;
+      emit({
+        type: "delta",
+        solution: solutionKey,
+        text
+      });
+    }
+
+    emit({
+      type: "solution_done",
+      solution: solutionKey
+    });
+
+    return answer;
+  }
+
+  emit({ type: "started" });
+
+  [solution_1, solution_2] = await Promise.all([
+    streamSolution(groqModel, "solution_1"),
+    streamSolution(cohereModel, "solution_2")
+  ]);
+
+  emit({
+    type: "solutions_done",
+    solution_1,
+    solution_2
+  });
+
+  const judge = await evaluateJudge(problem, solution_1, solution_2);
+
+  emit({
+    type: "judge",
+    judge
+  });
+
+  const result = {
+    solution_1,
+    solution_2,
+    judge
+  };
+
+  emit({
+    type: "complete",
+    result
+  });
+
   return result;
 }
