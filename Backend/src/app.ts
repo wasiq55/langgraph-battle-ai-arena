@@ -57,6 +57,39 @@ app.use(express.json({ limit: "2mb" }));
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
 
+
+app.get("/api/conversations", requireAuth, async (req, res) => {
+  try {
+    const authUser = (req as AuthenticatedRequest).authUser;
+
+    if (!authUser) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required."
+      });
+    }
+
+    const conversations = await Conversation.find({
+      userId: authUser.userId
+    })
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    return res.status(200).json({
+      success: true,
+      conversations
+    });
+  } catch (error) {
+    console.error("Failed to load conversation history:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load conversation history."
+    });
+  }
+});
+
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {

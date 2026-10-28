@@ -9,7 +9,9 @@ const API_BASE =
     ? "http://localhost:3000"
     : "https://langgraph-battle-ai-arena-4id8.onrender.com");
 
-const STREAM_URL = `${API_BASE.replace(/\/+$/, "").replace(/\/invoke$/, "")}/invoke/stream`;
+const API_ROOT = API_BASE.replace(/\/+$/, "").replace(/\/invoke$/, "");
+const STREAM_URL = `${API_ROOT}/invoke/stream`;
+const HISTORY_URL = `${API_ROOT}/api/conversations`;
 const MAX_FILES = 10;
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
@@ -57,6 +59,64 @@ function readHistory(user) {
   } catch {
     return [];
   }
+}
+
+function convertMongoConversation(conversation) {
+  const turns = Array.isArray(conversation.turns)
+    ? conversation.turns
+    : [];
+
+  const messages = [];
+
+  turns.forEach((turn, index) => {
+    const createdAt =
+      turn.createdAt ||
+      conversation.updatedAt ||
+      conversation.createdAt ||
+      new Date().toISOString();
+
+    const attachments = (
+      Array.isArray(turn.attachments) ? turn.attachments : []
+    ).map((file, fileIndex) => ({
+      id: file.fileId || `${turn._id || index}-file-${fileIndex}`,
+      fileId: file.fileId || "",
+      name: file.filename || file.name || "Attachment",
+      size: Number(file.size) || 0,
+      type: file.contentType || file.type || ""
+    }));
+
+    messages.push({
+      id: `user-${turn._id || `${conversation.conversationId}-${index}`}`,
+      role: "user",
+      content: turn.question || "",
+      attachments,
+      createdAt
+    });
+
+    messages.push({
+      id: `assistant-${turn._id || `${conversation.conversationId}-${index}`}`,
+      role: "assistant",
+      content: "",
+      solution_1: turn.solution_1 || "",
+      solution_2: turn.solution_2 || "",
+      judge: turn.judge || null,
+      streaming: false,
+      createdAt
+    });
+  });
+
+  return {
+    id: conversation.conversationId,
+    title:
+      conversation.title ||
+      turns[0]?.question?.slice(0, 48) ||
+      "New chat",
+    messages,
+    updatedAt:
+      conversation.updatedAt ||
+      conversation.createdAt ||
+      new Date().toISOString()
+  };
 }
 
 function formatDate(value) {
@@ -149,11 +209,12 @@ function JudgeSection({ judge }) {
   let winner = "Scores unavailable";
 
   if (valid1 && valid2) {
-    winner = score1 > score2
-      ? "Solution 1 wins"
-      : score2 > score1
-        ? "Solution 2 wins"
-        : "It's a tie";
+    winner =
+      score1 > score2
+        ? "Solution 1 wins"
+        : score2 > score1
+          ? "Solution 2 wins"
+          : "It's a tie";
   }
 
   return (
@@ -235,11 +296,11 @@ function LoadingDots() {
 }
 
 export default function ChatInterface({ user, onLogout }) {
-  const [chats, setChats] = useState(() => readHistory(user));
-  const [activeChatId, setActiveChatId] = useState(() => {
-    const history = readHistory(user);
-    return history[0]?.id || null;
-  });
+  const identity = getIdentity(user);
+
+  const [chats, setChats] = useState([]);
+  const [activeChatId, setActiveChatId] = useState(null);
+  const [loadedIdentity, setLoadedIdentity] = useState(null);
   const [input, setInput] = useState("");
   const [files, setFiles] = useState([]);
   const [busy, setBusy] = useState(false);
@@ -267,8 +328,120 @@ export default function ChatInterface({ user, onLogout }) {
   }, [busy]);
 
   useEffect(() => {
-    localStorage.setItem(getHistoryKey(user), JSON.stringify(chats));
-  }, [chats, user]);
+    let cancelled = false;
+
+    async function loadConversationHistory() {
+      setLoadedIdentity(null);
+      setChats([]);
+      setActiveChatId(null);
+      activeChatIdRef.current = null;
+
+      const localChats = readHistory(user);
+      const token = localStorage.getItem("battlearena_token");
+
+      if (!token) {
+        if (!cancelled) {
+          setChats(localChats);
+          setActiveChatId(localChats[0]?.id || null);
+          activeChatIdRef.current = localChats[0]?.id || null;
+          setLoadedIdentity(identity);
+        }
+        return;
+      }
+
+      try {
+        const response = await fetch(HISTORY_URL, {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${token}`
+          }
+        });
+
+        if (response.status === 401 || response.status === 403) {
+          if (!cancelled) {
+            setChats(localChats);
+            setActiveChatId(localChats[0]?.id || null);
+            activeChatIdRef.current = localChats[0]?.id || null;
+            setLoadedIdentity(identity);
+          }
+          return;
+        }
+
+        if (!response.ok) {
+          throw new Error(
+            `Could not load saved conversations (${response.status}).`
+          );
+        }
+
+        const data = await response.json();
+
+        if (data.success === false) {
+          throw new Error(data.message || "Could not load conversations.");
+        }
+
+        const mongoChats = Array.isArray(data.conversations)
+          ? data.conversations
+              .filter(
+                conversation =>
+                  conversation &&
+                  typeof conversation.conversationId === "string"
+              )
+              .map(convertMongoConversation)
+          : [];
+
+        const mergedChats = new Map();
+
+        for (const chat of localChats) {
+          mergedChats.set(chat.id, chat);
+        }
+
+        for (const chat of mongoChats) {
+          mergedChats.set(chat.id, chat);
+        }
+
+        const combinedChats = Array.from(mergedChats.values()).sort(
+          (a, b) =>
+            new Date(b.updatedAt).getTime() -
+            new Date(a.updatedAt).getTime()
+        );
+
+        if (!cancelled) {
+          setChats(combinedChats);
+          setActiveChatId(combinedChats[0]?.id || null);
+          activeChatIdRef.current = combinedChats[0]?.id || null;
+          setLoadedIdentity(identity);
+        }
+      } catch (loadError) {
+        console.error("Conversation history loading failed:", loadError);
+
+        if (!cancelled) {
+          setChats(localChats);
+          setActiveChatId(localChats[0]?.id || null);
+          activeChatIdRef.current = localChats[0]?.id || null;
+          setError(
+            "Could not sync conversation history from the server. Showing locally saved chats."
+          );
+          setLoadedIdentity(identity);
+        }
+      }
+    }
+
+    loadConversationHistory();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [identity]);
+
+  useEffect(() => {
+    if (loadedIdentity !== identity) return;
+
+    try {
+      localStorage.setItem(getHistoryKey(user), JSON.stringify(chats));
+    } catch (storageError) {
+      console.error("Could not save local chat history:", storageError);
+    }
+  }, [chats, user, identity, loadedIdentity]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -336,7 +509,9 @@ export default function ChatInterface({ user, onLogout }) {
     const incoming = Array.from(incomingFiles || []);
     const accepted = [];
     const problems = [];
-    const existingNames = new Set(files.map(file => `${file.name}-${file.size}`));
+    const existingNames = new Set(
+      files.map(file => `${file.name}-${file.size}`)
+    );
 
     for (const file of incoming) {
       const key = `${file.name}-${file.size}`;
@@ -367,7 +542,9 @@ export default function ChatInterface({ user, onLogout }) {
   }, [files]);
 
   const removeFile = useCallback((index) => {
-    setFiles(previous => previous.filter((_, fileIndex) => fileIndex !== index));
+    setFiles(previous =>
+      previous.filter((_, fileIndex) => fileIndex !== index)
+    );
   }, []);
 
   async function sendMessage(event) {
@@ -391,6 +568,7 @@ export default function ChatInterface({ user, onLogout }) {
     }
 
     const currentFiles = [...files];
+
     const userMessage = {
       id: makeId(),
       role: "user",
@@ -416,9 +594,10 @@ export default function ChatInterface({ user, onLogout }) {
 
     updateChat(chatId, currentChat => ({
       ...currentChat,
-      title: currentChat.messages.length === 0
-        ? (prompt || currentFiles[0]?.name || "New chat").slice(0, 48)
-        : currentChat.title,
+      title:
+        currentChat.messages.length === 0
+          ? (prompt || currentFiles[0]?.name || "New chat").slice(0, 48)
+          : currentChat.title,
       messages: [
         ...currentChat.messages,
         userMessage,

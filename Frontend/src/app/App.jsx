@@ -19,13 +19,13 @@ function getCurrentPath() {
 }
 
 export default function App() {
-  const [user, setUser] = useState<any>(null);
+  const [user, setUser] = useState(null);
   const [checkingAuth, setCheckingAuth] = useState(true);
   const [authError, setAuthError] = useState("");
   const [authRetry, setAuthRetry] = useState(0);
   const [path, setPath] = useState(getCurrentPath());
 
-  const navigate = useCallback((nextPath: string) => {
+  const navigate = useCallback((nextPath) => {
     const destination =
       nextPath === "/" ? HOME_PATH : `${BASE_PATH}${nextPath}`;
 
