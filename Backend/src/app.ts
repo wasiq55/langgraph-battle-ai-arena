@@ -918,52 +918,113 @@ app.post(
   }
 );
 
+
 app.post(
   "/invoke/stream",
   requireAuth,
   handleUpload,
   async (req, res) => {
     let questionRecordId: string | null = null;
+    let clientDisconnected = false;
+    let keepAlive: ReturnType<typeof setInterval> | undefined;
+
+    const emit = (event: unknown) => {
+      if (clientDisconnected || res.destroyed || res.writableEnded) {
+        return;
+      }
+
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
+
+    res.on("close", () => {
+      if (!res.writableEnded) {
+        clientDisconnected = true;
+        console.log("Streaming client disconnected.");
+      }
+
+      if (keepAlive) {
+        clearInterval(keepAlive);
+      }
+    });
+
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+
+    keepAlive = setInterval(() => {
+      if (!clientDisconnected && !res.destroyed && !res.writableEnded) {
+        res.write(": keep-alive\n\n");
+      }
+    }, 15000);
 
     try {
+      emit({
+        type: "progress",
+        message: "Preparing your request..."
+      });
+
       questionRecordId = await createPendingRequest(req);
+
+      if (clientDisconnected) {
+        await markRequestFailed(
+          questionRecordId,
+          "Client disconnected before processing completed."
+        );
+        return;
+      }
+
+      emit({
+        type: "progress",
+        message: "Saving uploaded files..."
+      });
 
       await storeUploadedFiles(req, questionRecordId);
 
+      if (clientDisconnected) {
+        await markRequestFailed(
+          questionRecordId,
+          "Client disconnected before processing completed."
+        );
+        return;
+      }
+
+      emit({
+        type: "progress",
+        message: "Analyzing your prompt and attachments..."
+      });
+
       const problem = await prepareProblem(req);
 
-      res.status(200);
-      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-      res.setHeader("Cache-Control", "no-cache, no-transform");
-      res.setHeader("X-Accel-Buffering", "no");
-      res.flushHeaders();
-
-      const emit = (event: unknown) => {
-        if (!res.destroyed && !res.writableEnded) {
-          res.write(`data: ${JSON.stringify(event)}\n\n`);
-        }
-      };
-
-      req.on("close", () => {
-        if (!res.writableEnded) {
-          console.log("Streaming client disconnected.");
-        }
-      });
+      if (clientDisconnected) {
+        await markRequestFailed(
+          questionRecordId,
+          "Client disconnected before graph execution."
+        );
+        return;
+      }
 
       console.log("Starting streaming graph execution...");
 
       const result = await runGraphStream(problem, emit);
 
-      try {
-        await saveCompletedRequest(req, result, questionRecordId);
-      } catch (error) {
-        console.error(
-          "Could not save completed streaming request:",
-          error
+      if (!clientDisconnected) {
+        try {
+          await saveCompletedRequest(req, result, questionRecordId);
+        } catch (error) {
+          console.error(
+            "Could not save completed streaming request:",
+            error
+          );
+        }
+      } else {
+        console.log(
+          "Client disconnected while graph execution was running."
         );
       }
 
-      if (!res.destroyed && !res.writableEnded) {
+      if (!clientDisconnected && !res.destroyed && !res.writableEnded) {
         res.end();
       }
     } catch (error) {
@@ -974,27 +1035,25 @@ app.post(
 
       await markRequestFailed(questionRecordId, message);
 
-      if (res.headersSent) {
-        if (!res.destroyed && !res.writableEnded) {
-          res.write(
-            `data: ${JSON.stringify({
-              type: "error",
-              message
-            })}\n\n`
-          );
-          res.end();
-        }
-      } else {
-        res.status(
-          message.startsWith("Please enter") ? 400 : 500
-        ).json({
-          success: false,
-          message: "Graph execution failed",
-          error: message
+      if (!clientDisconnected && !res.destroyed && !res.writableEnded) {
+        emit({
+          type: "error",
+          message
         });
+
+        res.end();
+      }
+    } finally {
+      if (keepAlive) {
+        clearInterval(keepAlive);
+      }
+
+      if (!clientDisconnected && !res.destroyed && !res.writableEnded) {
+        res.end();
       }
     }
   }
 );
+
 
 export default app;
