@@ -1,7 +1,7 @@
 
 import { Router } from "express";
 import mongoose from "mongoose";
-import { GridFSBucket, ObjectId } from "mongodb";
+import { GridFSBucket } from "mongodb";
 import User from "../models/User.js";
 import Conversation from "../models/Conversation.js";
 import Question from "../models/Question.js";
@@ -12,22 +12,59 @@ const router = Router();
 
 router.use(requireAuth, requireAdmin);
 
-function getUploadBucket() {
+function getDatabase() {
   const db = mongoose.connection.db;
 
   if (!db) {
     throw new Error("MongoDB database connection is not ready");
   }
 
-  return new GridFSBucket(db, { bucketName: "uploads" });
+  return db;
 }
 
-function escapeRegex(value) {
+function getUploadBucket() {
+  return new GridFSBucket(getDatabase(), {
+    bucketName: "uploads"
+  });
+}
+
+function getGeneratedImageBucket() {
+  return new GridFSBucket(getDatabase(), {
+    bucketName: "generatedImages"
+  });
+}
+
+function escapeRegex(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function getPagination(req: {
+  query: Record<string, unknown>;
+}) {
+  const pageValue = Number(req.query.page);
+  const limitValue = Number(req.query.limit);
+
+  const page =
+    Number.isFinite(pageValue) && pageValue > 0
+      ? Math.floor(pageValue)
+      : 1;
+
+  const limit =
+    Number.isFinite(limitValue) && limitValue > 0
+      ? Math.min(50, Math.floor(limitValue))
+      : 10;
+
+  return {
+    page,
+    limit,
+    skip: (page - 1) * limit
+  };
 }
 
 router.get("/stats", async (_req, res) => {
   try {
+    const db = getDatabase();
+
     const [
       totalUsers,
       totalConversations,
@@ -35,7 +72,8 @@ router.get("/stats", async (_req, res) => {
       pendingQuestions,
       completedQuestions,
       failedQuestions,
-      totalFiles,
+      uploadedFiles,
+      generatedImages,
       recentUsers
     ] = await Promise.all([
       User.countDocuments(),
@@ -44,7 +82,8 @@ router.get("/stats", async (_req, res) => {
       Question.countDocuments({ status: "pending" }),
       Question.countDocuments({ status: "completed" }),
       Question.countDocuments({ status: "failed" }),
-      mongoose.connection.db!.collection("uploads.files").countDocuments(),
+      db.collection("uploads.files").countDocuments(),
+      db.collection("generatedImages.files").countDocuments(),
       User.find()
         .select("name email role createdAt")
         .sort({ createdAt: -1 })
@@ -61,12 +100,15 @@ router.get("/stats", async (_req, res) => {
         pendingQuestions,
         completedQuestions,
         failedQuestions,
-        totalFiles,
+        totalFiles: uploadedFiles + generatedImages,
+        uploadedFiles,
+        generatedImages,
         recentUsers
       }
     });
   } catch (error) {
     console.error("Admin stats error:", error);
+
     res.status(500).json({
       success: false,
       message: "Unable to load admin statistics"
@@ -76,10 +118,12 @@ router.get("/stats", async (_req, res) => {
 
 router.get("/files", async (req, res) => {
   try {
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 10));
+    const { page, limit, skip } = getPagination(req);
+
     const search =
-      typeof req.query.search === "string" ? req.query.search.trim() : "";
+      typeof req.query.search === "string"
+        ? req.query.search.trim()
+        : "";
 
     const filter: Record<string, unknown> = {};
 
@@ -89,27 +133,60 @@ router.get("/files", async (req, res) => {
       filter.$or = [
         { filename: { $regex: escaped, $options: "i" } },
         { "metadata.originalName": { $regex: escaped, $options: "i" } },
-        { "metadata.userEmail": { $regex: escaped, $options: "i" } }
+        { "metadata.userEmail": { $regex: escaped, $options: "i" } },
+        { "metadata.prompt": { $regex: escaped, $options: "i" } }
       ];
     }
 
-    const filesCollection =
-      mongoose.connection.db!.collection("uploads.files");
+    const db = getDatabase();
+    const uploadsBucket = getUploadBucket();
+    const generatedImageBucket = getGeneratedImageBucket();
 
-    const [storedFiles, total] = await Promise.all([
-      getUploadBucket()
-        .find(filter)
+    const fetchLimit = skip + limit;
+
+    const [
+      uploadedFiles,
+      generatedImages,
+      uploadedTotal,
+      generatedTotal
+    ] = await Promise.all([
+      uploadsBucket
+        .find(filter as any)
         .sort({ uploadDate: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
+        .limit(fetchLimit)
         .toArray(),
-      filesCollection.countDocuments(filter)
+
+      generatedImageBucket
+        .find(filter as any)
+        .sort({ uploadDate: -1 })
+        .limit(fetchLimit)
+        .toArray(),
+
+      db.collection("uploads.files").countDocuments(filter),
+      db.collection("generatedImages.files").countDocuments(filter)
     ]);
+
+    const combinedFiles = [
+      ...uploadedFiles.map((file) => ({
+        file,
+        fileType: "upload" as const
+      })),
+      ...generatedImages.map((file) => ({
+        file,
+        fileType: "generated-image" as const
+      }))
+    ]
+      .sort(
+        (a, b) =>
+          new Date(b.file.uploadDate).getTime() -
+          new Date(a.file.uploadDate).getTime()
+      )
+      .slice(skip, skip + limit);
 
     const userIds = [
       ...new Set(
-        storedFiles
-          .map((file) => String(file.metadata?.userId || ""))
+        combinedFiles
+          .map(({ file }) => String(file.metadata?.userId || ""))
           .filter((id) => mongoose.isValidObjectId(id))
       )
     ];
@@ -117,7 +194,9 @@ router.get("/files", async (req, res) => {
     const uploaderUsers = userIds.length
       ? await User.find({
           _id: {
-            $in: userIds.map((id) => new mongoose.Types.ObjectId(id))
+            $in: userIds.map(
+              (id) => new mongoose.Types.ObjectId(id)
+            )
           }
         })
           .select("name email")
@@ -125,37 +204,55 @@ router.get("/files", async (req, res) => {
       : [];
 
     const uploaderMap = new Map(
-      uploaderUsers.map((item) => [
-        String(item._id),
-        { name: item.name, email: item.email }
+      uploaderUsers.map((user) => [
+        String(user._id),
+        {
+          name: user.name,
+          email: user.email
+        }
       ])
     );
 
-    const files = storedFiles.map((file) => {
+    const files = combinedFiles.map(({ file, fileType }) => {
       const metadata = file.metadata || {};
       const fileId = String(file._id);
+      const isGenerated = fileType === "generated-image";
+      const endpoint = isGenerated ? "/api/images" : "/api/files";
+      const uploader = uploaderMap.get(
+        String(metadata.userId || "")
+      );
 
       return {
         fileId,
         _id: fileId,
-        filename: metadata.originalName || file.filename || "Unnamed file",
-        contentType: metadata.contentType || "application/octet-stream",
+        fileType,
+        filename:
+          metadata.originalName ||
+          file.filename ||
+          (isGenerated ? "Generated image" : "Unnamed file"),
+        contentType:
+          metadata.contentType ||
+          (isGenerated
+            ? "image/jpeg"
+            : "application/octet-stream"),
         size: file.length,
         uploadedAt: metadata.uploadedAt || file.uploadDate,
         uploadDate: file.uploadDate,
         userId: metadata.userId || "",
-        userEmail: metadata.userEmail || "",
-        uploader:
-          uploaderMap.get(String(metadata.userId || "")) || {
-            name: "Unknown user",
-            email: metadata.userEmail || ""
-          },
+        userEmail: metadata.userEmail || uploader?.email || "",
+        uploader: uploader || {
+          name: "Unknown user",
+          email: metadata.userEmail || ""
+        },
         conversationId: metadata.conversationId || "",
         questionId: metadata.questionId || "",
-        previewUrl: `/api/files/${fileId}`,
-        downloadUrl: `/api/files/${fileId}?download=true`
+        prompt: metadata.prompt || "",
+        previewUrl: `${endpoint}/${fileId}`,
+        downloadUrl: `${endpoint}/${fileId}?download=true`
       };
     });
+
+    const total = uploadedTotal + generatedTotal;
 
     res.json({
       success: true,
@@ -169,6 +266,7 @@ router.get("/files", async (req, res) => {
     });
   } catch (error) {
     console.error("Admin files error:", error);
+
     res.status(500).json({
       success: false,
       message: "Unable to load uploaded files"
@@ -178,15 +276,18 @@ router.get("/files", async (req, res) => {
 
 router.get("/users", async (req, res) => {
   try {
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 10));
+    const { page, limit, skip } = getPagination(req);
+
     const search =
-      typeof req.query.search === "string" ? req.query.search.trim() : "";
+      typeof req.query.search === "string"
+        ? req.query.search.trim()
+        : "";
 
     const filter: Record<string, unknown> = {};
 
     if (search) {
       const escaped = escapeRegex(search);
+
       filter.$or = [
         { name: { $regex: escaped, $options: "i" } },
         { email: { $regex: escaped, $options: "i" } }
@@ -197,9 +298,10 @@ router.get("/users", async (req, res) => {
       User.find(filter)
         .select("name email role createdAt")
         .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
+        .skip(skip)
         .limit(limit)
         .lean(),
+
       User.countDocuments(filter)
     ]);
 
@@ -215,6 +317,7 @@ router.get("/users", async (req, res) => {
     });
   } catch (error) {
     console.error("Admin users error:", error);
+
     res.status(500).json({
       success: false,
       message: "Unable to load users"
@@ -247,34 +350,48 @@ router.get("/users/:userId/details", async (req, res) => {
     const userId = String(user._id);
 
     const questionFilter = user.email
-      ? { $or: [{ userId }, { userEmail: user.email }] }
+      ? {
+          $or: [
+            { userId },
+            { userEmail: user.email }
+          ]
+        }
       : { userId };
 
-    const [questions, conversations, messages, totalUploads] =
-      await Promise.all([
-        Question.find(questionFilter)
-          .select(
-            "userId userEmail chatId question solution1 solution2 judge status errorMessage attachments createdAt updatedAt"
-          )
-          .sort({ createdAt: -1 })
-          .lean(),
+    const db = getDatabase();
 
-        Conversation.find({ userId: user._id })
-          .select("conversationId title turns createdAt updatedAt")
-          .sort({ updatedAt: -1 })
-          .lean(),
+    const [
+      questions,
+      conversations,
+      messages,
+      totalUploads,
+      totalGeneratedImages
+    ] = await Promise.all([
+      Question.find(questionFilter)
+        .select(
+          "userId userEmail chatId question solution1 solution2 judge status errorMessage attachments createdAt updatedAt"
+        )
+        .sort({ createdAt: -1 })
+        .lean(),
 
-        Message.find({ userId: user._id })
-          .select(
-            "conversationId question response status createdAt updatedAt"
-          )
-          .sort({ createdAt: -1 })
-          .lean(),
+      Conversation.find({ userId: user._id })
+        .select("conversationId title turns createdAt updatedAt")
+        .sort({ updatedAt: -1 })
+        .lean(),
 
-        mongoose.connection.db!
-          .collection("uploads.files")
-          .countDocuments({ "metadata.userId": userId })
-      ]);
+      Message.find({ userId: user._id })
+        .select("conversationId question response status createdAt updatedAt")
+        .sort({ createdAt: -1 })
+        .lean(),
+
+      db.collection("uploads.files").countDocuments({
+        "metadata.userId": userId
+      }),
+
+      db.collection("generatedImages.files").countDocuments({
+        "metadata.userId": userId
+      })
+    ]);
 
     res.json({
       success: true,
@@ -286,11 +403,14 @@ router.get("/users/:userId/details", async (req, res) => {
         totalQuestions: questions.length,
         totalConversations: conversations.length,
         totalMessages: messages.length,
-        totalUploads
+        totalUploads,
+        totalGeneratedImages,
+        totalFiles: totalUploads + totalGeneratedImages
       }
     });
   } catch (error) {
     console.error("Admin user details error:", error);
+
     res.status(500).json({
       success: false,
       message: "Unable to load this user's history"
@@ -300,17 +420,17 @@ router.get("/users/:userId/details", async (req, res) => {
 
 router.get("/conversations", async (req, res) => {
   try {
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 10));
+    const { page, limit, skip } = getPagination(req);
 
     const [conversations, total] = await Promise.all([
       Conversation.find()
         .populate("userId", "name email")
         .select("conversationId userId title turns createdAt updatedAt")
         .sort({ updatedAt: -1 })
-        .skip((page - 1) * limit)
+        .skip(skip)
         .limit(limit)
         .lean(),
+
       Conversation.countDocuments()
     ]);
 
@@ -326,6 +446,7 @@ router.get("/conversations", async (req, res) => {
     });
   } catch (error) {
     console.error("Admin conversations error:", error);
+
     res.status(500).json({
       success: false,
       message: "Unable to load conversations"
@@ -335,10 +456,12 @@ router.get("/conversations", async (req, res) => {
 
 router.get("/questions", async (req, res) => {
   try {
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 10));
+    const { page, limit, skip } = getPagination(req);
+
     const status =
-      typeof req.query.status === "string" ? req.query.status : "";
+      typeof req.query.status === "string"
+        ? req.query.status
+        : "";
 
     const filter: Record<string, unknown> = {};
 
@@ -352,9 +475,10 @@ router.get("/questions", async (req, res) => {
           "userId userEmail chatId question solution1 solution2 judge status errorMessage attachments createdAt updatedAt"
         )
         .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
+        .skip(skip)
         .limit(limit)
         .lean(),
+
       Question.countDocuments(filter)
     ]);
 
@@ -370,6 +494,7 @@ router.get("/questions", async (req, res) => {
     });
   } catch (error) {
     console.error("Admin questions error:", error);
+
     res.status(500).json({
       success: false,
       message: "Unable to load questions"
@@ -400,6 +525,7 @@ router.get("/users/:userId/conversations", async (req, res) => {
     });
   } catch (error) {
     console.error("Admin user conversations error:", error);
+
     res.status(500).json({
       success: false,
       message: "Unable to load this user's conversations"

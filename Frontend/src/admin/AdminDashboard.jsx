@@ -16,12 +16,12 @@ function formatDate(value) {
   return Number.isNaN(date.getTime())
     ? "—"
     : date.toLocaleString([], {
-        day: "2-digit",
-        month: "short",
-        year: "numeric",
-        hour: "2-digit",
-        minute: "2-digit"
-      });
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit"
+    });
 }
 
 function formatContent(value, fallback = "No data available.") {
@@ -396,21 +396,56 @@ export default function AdminDashboard({ apiUrl, user, onLogout, onBack }) {
     };
   }, []);
 
+
   const fetchFileBlob = useCallback(async (file) => {
     const id = fileId(file);
-    if (!id) throw new Error("This file record does not contain a file ID.");
+
+    if (!id) {
+      throw new Error("This file record does not contain a file ID.");
+    }
+
+    const fileKind = String(
+      file?.fileType ||
+      file?.storageType ||
+      file?.bucket ||
+      ""
+    ).toLowerCase();
+
+    const isGeneratedImage = [
+      "generated-image",
+      "generatedimage",
+      "generatedimages",
+      "generatedimagesbucket"
+    ].includes(fileKind);
+
+    const endpoint = isGeneratedImage
+      ? "/api/images"
+      : "/api/files";
 
     const token = localStorage.getItem("battlearena_token");
-    const response = await fetch(`${apiUrl}/api/files/${encodeURIComponent(id)}`, {
-      headers: { Authorization: `Bearer ${token || ""}` }
-    });
+
+    const response = await fetch(
+      `${apiUrl}${endpoint}/${encodeURIComponent(id)}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token || ""}`
+        }
+      }
+    );
 
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
-      throw new Error(data.message || data.error || `File request failed (${response.status})`);
+
+      throw new Error(
+        data.message ||
+        data.error ||
+        `File request failed (${response.status})`
+      );
     }
+
     return response.blob();
   }, [apiUrl]);
+
 
   const previewFile = async (file) => {
     closeFilePreview();

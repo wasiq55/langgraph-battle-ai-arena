@@ -3,6 +3,10 @@ import mongoose, { Schema } from "mongoose";
 
 const attachmentSchema = new Schema(
   {
+    type: {
+      type: String,
+      default: "file"
+    },
     fileId: {
       type: String,
       required: true
@@ -18,6 +22,10 @@ const attachmentSchema = new Schema(
     size: {
       type: Number,
       default: 0
+    },
+    prompt: {
+      type: String,
+      default: ""
     },
     uploadedAt: {
       type: Date,
@@ -61,7 +69,8 @@ const conversationSchema = new Schema(
   {
     conversationId: {
       type: String,
-      required: true
+      required: true,
+      trim: true
     },
     userId: {
       type: Schema.Types.ObjectId,

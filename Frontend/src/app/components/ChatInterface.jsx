@@ -12,6 +12,8 @@ const API_BASE =
 const API_ROOT = API_BASE.replace(/\/+$/, "").replace(/\/invoke$/, "");
 const STREAM_URL = `${API_ROOT}/invoke/stream`;
 const HISTORY_URL = `${API_ROOT}/api/conversations`;
+const IMAGE_GENERATE_URL = `${API_ROOT}/api/images/generate`;
+
 const MAX_FILES = 10;
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
@@ -75,18 +77,29 @@ function convertMongoConversation(conversation) {
       conversation.createdAt ||
       new Date().toISOString();
 
-    const attachments = (
-      Array.isArray(turn.attachments) ? turn.attachments : []
-    ).map((file, fileIndex) => ({
-      id: file.fileId || `${turn._id || index}-file-${fileIndex}`,
-      fileId: file.fileId || "",
-      name: file.filename || file.name || "Attachment",
-      size: Number(file.size) || 0,
-      type: file.contentType || file.type || ""
-    }));
+    const allAttachments = Array.isArray(turn.attachments)
+      ? turn.attachments
+      : [];
+
+    const generatedImage = allAttachments.find(
+      file => file?.type === "generated-image" && file?.fileId
+    );
+
+    const attachments = allAttachments
+      .filter(file => file?.type !== "generated-image")
+      .map((file, fileIndex) => ({
+        id: file.fileId || `${turn._id || index}-file-${fileIndex}`,
+        fileId: file.fileId || "",
+        name: file.filename || file.name || "Attachment",
+        size: Number(file.size) || 0,
+        type: file.contentType || file.type || ""
+      }));
+
+    const turnId =
+      turn._id || `${conversation.conversationId}-${index}`;
 
     messages.push({
-      id: `user-${turn._id || `${conversation.conversationId}-${index}`}`,
+      id: `user-${turnId}`,
       role: "user",
       content: turn.question || "",
       attachments,
@@ -94,13 +107,18 @@ function convertMongoConversation(conversation) {
     });
 
     messages.push({
-      id: `assistant-${turn._id || `${conversation.conversationId}-${index}`}`,
+      id: `assistant-${turnId}`,
       role: "assistant",
-      content: "",
+      content: generatedImage ? "Your image is ready." : "",
       solution_1: turn.solution_1 || "",
       solution_2: turn.solution_2 || "",
       judge: turn.judge || null,
       streaming: false,
+      imageGeneration: Boolean(generatedImage),
+      fileId: generatedImage?.fileId || "",
+      prompt: generatedImage?.prompt || turn.question || "",
+      image: "",
+      imageLoadError: false,
       createdAt
     });
   });
@@ -119,6 +137,59 @@ function convertMongoConversation(conversation) {
   };
 }
 
+async function restoreChatImages(chat, token) {
+  const messages = await Promise.all(
+    chat.messages.map(async message => {
+      if (!message.imageGeneration || !message.fileId) {
+        return message;
+      }
+
+      try {
+        const response = await fetch(
+          `${API_ROOT}/api/images/${encodeURIComponent(message.fileId)}`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`
+            }
+          }
+        );
+
+        if (!response.ok) {
+          throw new Error(`Image request failed: ${response.status}`);
+        }
+
+        const blob = await response.blob();
+
+        if (!blob.type.startsWith("image/")) {
+          throw new Error("The saved file is not an image.");
+        }
+
+        return {
+          ...message,
+          image: URL.createObjectURL(blob),
+          imageLoadError: false
+        };
+      } catch (error) {
+        console.error(
+          `Could not restore image ${message.fileId}:`,
+          error
+        );
+
+        return {
+          ...message,
+          image: "",
+          imageLoadError: true
+        };
+      }
+    })
+  );
+
+  return {
+    ...chat,
+    messages
+  };
+}
+
 function formatDate(value) {
   if (!value) return "";
 
@@ -132,7 +203,7 @@ function formatDate(value) {
   });
 }
 
-function getFileIcon(name) {
+function getFileIcon(name = "") {
   const extension = name.split(".").pop()?.toLowerCase();
 
   if (["png", "jpg", "jpeg", "webp"].includes(extension)) return "▧";
@@ -173,6 +244,7 @@ function ResponseSection({
             {title}
           </h3>
         </div>
+
         {streaming && (
           <span className="flex shrink-0 items-center gap-1.5 text-xs text-sky-600">
             <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-500" />
@@ -180,6 +252,7 @@ function ResponseSection({
           </span>
         )}
       </div>
+
       <div className="min-w-0 px-4 py-4">
         {text ? (
           <>
@@ -188,17 +261,114 @@ function ResponseSection({
               <span className="ml-1 inline-block h-4 w-1.5 animate-pulse rounded-sm bg-sky-500 align-middle" />
             )}
           </>
+        ) : streaming ? (
+          <div
+            className="space-y-3 py-1"
+            role="status"
+            aria-label={`${title} is generating`}
+          >
+            <div className="flex items-center gap-2 text-sm text-slate-500">
+              <span className="h-2 w-2 animate-pulse rounded-full bg-sky-500" />
+              <span className="animate-pulse">
+                Generating your solution...
+              </span>
+            </div>
+
+            <div className="space-y-2.5" aria-hidden="true">
+              <div className="h-2.5 w-full animate-pulse rounded-full bg-slate-100" />
+              <div className="h-2.5 w-[88%] animate-pulse rounded-full bg-slate-100 [animation-delay:100ms]" />
+              <div className="h-2.5 w-[72%] animate-pulse rounded-full bg-slate-100 [animation-delay:200ms]" />
+              <div className="h-2.5 w-[54%] animate-pulse rounded-full bg-slate-100 [animation-delay:300ms]" />
+            </div>
+
+            <div className="flex items-center gap-1 pt-1" aria-hidden="true">
+              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-sky-500 [animation-delay:-0.2s]" />
+              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-sky-500 [animation-delay:-0.1s]" />
+              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-sky-500" />
+            </div>
+          </div>
         ) : (
-          <p className="text-sm text-slate-400">
-            {streaming ? "Generating your solution..." : emptyText}
-          </p>
+          <p className="text-sm text-slate-400">{emptyText}</p>
         )}
       </div>
     </section>
   );
 }
 
+function JudgeThinking({ ready }) {
+  return (
+    <section
+      role="status"
+      aria-live="polite"
+      className="overflow-hidden rounded-2xl border border-emerald-200 bg-white shadow-sm"
+    >
+      <div className="relative overflow-hidden bg-gradient-to-r from-emerald-50 via-white to-sky-50 p-5 sm:p-6">
+        <div className="absolute inset-x-0 top-0 h-1 overflow-hidden bg-emerald-100">
+          <div className="h-full w-1/3 animate-[judgeProgress_1.8s_ease-in-out_infinite] rounded-full bg-emerald-500" />
+        </div>
+
+        <div className="flex items-start gap-4">
+          <div className="relative flex h-12 w-12 shrink-0 items-center justify-center">
+            <span className="absolute inset-0 animate-ping rounded-2xl bg-emerald-200/60" />
+            <span className="absolute inset-1 animate-spin rounded-2xl border-2 border-emerald-200 border-t-emerald-600" />
+            <span className="relative text-xl text-emerald-700">⚖</span>
+          </div>
+
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-sm font-bold text-slate-900">
+                AI Judge is evaluating
+              </h3>
+              <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-emerald-700">
+                In progress
+              </span>
+            </div>
+
+            <p className="mt-1 text-sm leading-6 text-slate-600">
+              {ready
+                ? "Both solutions are ready. The judge is comparing accuracy, reasoning, and completeness."
+                : "Groq and Cohere are preparing their answers. The judge will compare them when they are ready."}
+            </p>
+
+            <div className="mt-4 flex flex-wrap gap-2">
+              <span className={`rounded-lg border px-3 py-2 text-xs font-medium transition-colors duration-500 ${ready ? "border-sky-200 bg-sky-50 text-sky-700" : "border-slate-200 bg-white text-slate-500"}`}>
+                <span className="mr-2 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-sky-500" />
+                Groq solution
+              </span>
+
+              <span className={`rounded-lg border px-3 py-2 text-xs font-medium transition-colors duration-500 ${ready ? "border-violet-200 bg-violet-50 text-violet-700" : "border-slate-200 bg-white text-slate-500"}`}>
+                <span className="mr-2 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-violet-500" />
+                Cohere solution
+              </span>
+
+              <span className="rounded-lg border border-emerald-200 bg-white px-3 py-2 text-xs font-medium text-emerald-700">
+                <span className="mr-2 inline-block h-1.5 w-1.5 animate-ping rounded-full bg-emerald-500" />
+                AI Judge
+              </span>
+            </div>
+
+            <div className="mt-4 flex items-center gap-1.5">
+              <span className="h-2 w-2 animate-bounce rounded-full bg-emerald-500 [animation-delay:-0.2s]" />
+              <span className="h-2 w-2 animate-bounce rounded-full bg-emerald-500 [animation-delay:-0.1s]" />
+              <span className="h-2 w-2 animate-bounce rounded-full bg-emerald-500" />
+              <span className="ml-2 text-xs text-slate-500">
+                Please wait while the evaluation finishes
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function JudgeSection({ judge }) {
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    setVisible(true);
+  }, []);
+
   if (!judge) return null;
 
   const score1 = Number(judge.solution_1_score);
@@ -218,7 +388,7 @@ function JudgeSection({ judge }) {
   }
 
   return (
-    <section className="overflow-hidden rounded-2xl border border-emerald-200 bg-white shadow-sm">
+    <section className={`overflow-hidden rounded-2xl border border-emerald-200 bg-white shadow-sm transition-all duration-700 ease-out ${visible ? "translate-y-0 scale-100 opacity-100" : "translate-y-5 scale-[0.98] opacity-0"}`}>
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-emerald-100 bg-emerald-50/70 px-4 py-3">
         <div className="flex items-center gap-2">
           <span className="flex h-7 w-7 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
@@ -228,6 +398,7 @@ function JudgeSection({ judge }) {
             Judge's verdict
           </h3>
         </div>
+
         <span className="rounded-full border border-emerald-200 bg-white px-3 py-1 text-xs font-semibold text-emerald-700">
           {winner}
         </span>
@@ -268,9 +439,11 @@ function AttachmentChip({ file, onRemove, disabled }) {
       <span className="flex h-8 min-w-8 items-center justify-center rounded-lg bg-slate-100 px-1 text-[10px] font-bold text-slate-600">
         {getFileIcon(file.name)}
       </span>
+
       <span className="max-w-44 truncate text-xs font-medium text-slate-700">
         {file.name}
       </span>
+
       <button
         type="button"
         disabled={disabled}
@@ -290,7 +463,9 @@ function LoadingDots() {
       <span className="h-2 w-2 animate-bounce rounded-full bg-sky-500 [animation-delay:-0.2s]" />
       <span className="h-2 w-2 animate-bounce rounded-full bg-sky-500 [animation-delay:-0.1s]" />
       <span className="h-2 w-2 animate-bounce rounded-full bg-sky-500" />
-      <span className="ml-2 text-xs text-slate-500">Preparing your response</span>
+      <span className="ml-2 text-xs text-slate-500">
+        Preparing your response
+      </span>
     </div>
   );
 }
@@ -308,10 +483,12 @@ export default function ChatInterface({ user, onLogout }) {
   const [accountOpen, setAccountOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [imageMode, setImageMode] = useState(false);
 
   const fileInputRef = useRef(null);
   const textareaRef = useRef(null);
-  const bottomRef = useRef(null);
+  const scrollContainerRef = useRef(null);
+  const shouldAutoScrollRef = useRef(true);
   const accountRef = useRef(null);
   const activeChatIdRef = useRef(activeChatId);
   const busyRef = useRef(false);
@@ -380,13 +557,18 @@ export default function ChatInterface({ user, onLogout }) {
         }
 
         const mongoChats = Array.isArray(data.conversations)
-          ? data.conversations
-              .filter(
-                conversation =>
-                  conversation &&
-                  typeof conversation.conversationId === "string"
-              )
-              .map(convertMongoConversation)
+          ? await Promise.all(
+              data.conversations
+                .filter(
+                  conversation =>
+                    conversation &&
+                    typeof conversation.conversationId === "string"
+                )
+                .map(async conversation => {
+                  const chat = convertMongoConversation(conversation);
+                  return restoreChatImages(chat, token);
+                })
+            )
           : [];
 
         const mergedChats = new Map();
@@ -437,14 +619,31 @@ export default function ChatInterface({ user, onLogout }) {
     if (loadedIdentity !== identity) return;
 
     try {
-      localStorage.setItem(getHistoryKey(user), JSON.stringify(chats));
+      localStorage.setItem(
+        getHistoryKey(user),
+        JSON.stringify(
+          chats.map(chat => ({
+            ...chat,
+            messages: chat.messages
+              .filter(message => !message.imageGeneration)
+              .map(({ image, ...message }) => message)
+          }))
+        )
+      );
     } catch (storageError) {
       console.error("Could not save local chat history:", storageError);
     }
   }, [chats, user, identity, loadedIdentity]);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    const container = scrollContainerRef.current;
+
+    if (!container || !shouldAutoScrollRef.current) return;
+
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: "auto"
+    });
   }, [messages, busy]);
 
   useEffect(() => {
@@ -492,7 +691,7 @@ export default function ChatInterface({ user, onLogout }) {
     textareaRef.current?.focus();
   }, []);
 
-  const selectChat = useCallback((chatId) => {
+  const selectChat = useCallback(chatId => {
     if (busyRef.current) return;
 
     setActiveChatId(chatId);
@@ -503,7 +702,7 @@ export default function ChatInterface({ user, onLogout }) {
     setSidebarOpen(false);
   }, []);
 
-  const addFiles = useCallback((incomingFiles) => {
+  const addFiles = useCallback(incomingFiles => {
     if (busyRef.current) return;
 
     const incoming = Array.from(incomingFiles || []);
@@ -533,15 +732,10 @@ export default function ChatInterface({ user, onLogout }) {
     }
 
     setFiles(previous => [...previous, ...accepted]);
-
-    if (problems.length) {
-      setError(problems.join(" "));
-    } else {
-      setError("");
-    }
+    setError(problems.length ? problems.join(" ") : "");
   }, [files]);
 
-  const removeFile = useCallback((index) => {
+  const removeFile = useCallback(index => {
     setFiles(previous =>
       previous.filter((_, fileIndex) => fileIndex !== index)
     );
@@ -551,6 +745,11 @@ export default function ChatInterface({ user, onLogout }) {
     event?.preventDefault();
 
     if (busyRef.current) return;
+
+    if (imageMode) {
+      await generateImage();
+      return;
+    }
 
     const prompt = input.trim();
 
@@ -683,31 +882,21 @@ export default function ChatInterface({ user, onLogout }) {
         const event = JSON.parse(dataLine.slice(6));
 
         if (event.type === "delta") {
-          if (event.solution === "solution_1") {
+          if (
+            event.solution === "solution_1" ||
+            event.solution === "solution_2"
+          ) {
             updateChat(chatId, currentChat => ({
               ...currentChat,
-              messages: currentChat.messages.map(message =>
-                message.id === assistantMessage.id
-                  ? {
-                      ...message,
-                      solution_1: message.solution_1 + event.text
-                    }
-                  : message
-              )
-            }));
-          }
+              messages: currentChat.messages.map(message => {
+                if (message.id !== assistantMessage.id) return message;
 
-          if (event.solution === "solution_2") {
-            updateChat(chatId, currentChat => ({
-              ...currentChat,
-              messages: currentChat.messages.map(message =>
-                message.id === assistantMessage.id
-                  ? {
-                      ...message,
-                      solution_2: message.solution_2 + event.text
-                    }
-                  : message
-              )
+                return {
+                  ...message,
+                  [event.solution]:
+                    (message[event.solution] || "") + event.text
+                };
+              })
             }));
           }
         }
@@ -776,6 +965,189 @@ export default function ChatInterface({ user, onLogout }) {
       }));
 
       setError(message);
+    } finally {
+      setBusy(false);
+      busyRef.current = false;
+    }
+  }
+
+  async function generateImage() {
+    if (busyRef.current) return;
+
+    const prompt = input.trim();
+
+    if (!prompt) {
+      setError("Enter a description of the image you want to create.");
+      return;
+    }
+
+    const token = localStorage.getItem("battlearena_token");
+
+    if (!token) {
+      setError("Your session has expired. Please log in again.");
+      onLogout?.();
+      return;
+    }
+
+    let chatId = activeChatIdRef.current;
+    let chat = chats.find(item => item.id === chatId);
+
+    if (!chat) {
+      chat = createChat();
+      chatId = chat.id;
+      activeChatIdRef.current = chatId;
+      setActiveChatId(chatId);
+      setChats(previous => [chat, ...previous]);
+    }
+
+    const userMessage = {
+      id: makeId(),
+      role: "user",
+      content: `Create an image: ${prompt}`,
+      attachments: [],
+      createdAt: new Date().toISOString()
+    };
+
+    const assistantMessage = {
+      id: makeId(),
+      role: "assistant",
+      content: "Generating your image...",
+      image: "",
+      fileId: "",
+      prompt,
+      imageGeneration: true,
+      streaming: true,
+      createdAt: new Date().toISOString()
+    };
+
+    updateChat(chatId, currentChat => ({
+      ...currentChat,
+      title:
+        currentChat.messages.length === 0
+          ? `Image: ${prompt}`.slice(0, 48)
+          : currentChat.title,
+      messages: [
+        ...currentChat.messages,
+        userMessage,
+        assistantMessage
+      ]
+    }));
+
+    setInput("");
+    setError("");
+    setBusy(true);
+    busyRef.current = true;
+
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+    }
+
+    try {
+      const response = await fetch(IMAGE_GENERATE_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          prompt,
+          conversationId: chatId
+        })
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (response.status === 401 || response.status === 403) {
+        localStorage.removeItem("battlearena_token");
+        onLogout?.();
+        throw new Error(
+          "Your session is invalid or expired. Please log in again."
+        );
+      }
+
+      if (!response.ok || !data.success) {
+        throw new Error(
+          data.message || `Image generation failed (${response.status}).`
+        );
+      }
+
+      const fileId = data.fileId || data.attachment?.fileId;
+      let imageSource = "";
+
+      if (fileId) {
+        const imageResponse = await fetch(
+          `${API_ROOT}/api/images/${encodeURIComponent(fileId)}`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`
+            }
+          }
+        );
+
+        if (!imageResponse.ok) {
+          throw new Error(
+            `Could not load the generated image (${imageResponse.status}).`
+          );
+        }
+
+        const imageBlob = await imageResponse.blob();
+
+        if (!imageBlob.type.startsWith("image/")) {
+          throw new Error("The image endpoint did not return image data.");
+        }
+
+        imageSource = URL.createObjectURL(imageBlob);
+      } else if (
+        typeof data.image === "string" &&
+        data.image.trim()
+      ) {
+        imageSource = data.image.startsWith("data:image/")
+          ? data.image
+          : `data:${data.contentType || "image/jpeg"};base64,${data.image}`;
+      } else {
+        throw new Error(
+          "The server did not return a saved image ID or image data."
+        );
+      }
+
+      updateChat(chatId, currentChat => ({
+        ...currentChat,
+        messages: currentChat.messages.map(message =>
+          message.id === assistantMessage.id
+            ? {
+                ...message,
+                content: "Your image is ready.",
+                image: imageSource,
+                fileId: fileId || "",
+                prompt,
+                streaming: false,
+                imageLoadError: false,
+                error: ""
+              }
+            : message
+        )
+      }));
+    } catch (imageError) {
+      const errorMessage =
+        imageError instanceof Error
+          ? imageError.message
+          : "Unable to generate the image.";
+
+      updateChat(chatId, currentChat => ({
+        ...currentChat,
+        messages: currentChat.messages.map(message =>
+          message.id === assistantMessage.id
+            ? {
+                ...message,
+                content: "",
+                streaming: false,
+                error: errorMessage
+              }
+            : message
+        )
+      }));
+
+      setError(errorMessage);
     } finally {
       setBusy(false);
       busyRef.current = false;
@@ -852,12 +1224,14 @@ export default function ChatInterface({ user, onLogout }) {
               <path d="M12 3 14.4 9.6 21 12l-6.6 2.4L12 21l-2.4-6.6L3 12l6.6-2.4L12 3Z" strokeLinejoin="round" />
             </svg>
           </div>
+
           <div className="min-w-0">
             <h1 className="truncate text-sm font-bold text-slate-900">
               Battle AI Arena
             </h1>
             <p className="text-xs text-slate-500">Compare AI solutions</p>
           </div>
+
           <button
             type="button"
             onClick={() => setSidebarOpen(false)}
@@ -907,6 +1281,7 @@ export default function ChatInterface({ user, onLogout }) {
                 <svg viewBox="0 0 24 24" fill="none" className="mt-0.5 h-4 w-4 shrink-0" stroke="currentColor" strokeWidth="1.7">
                   <path d="M5 5.5A2.5 2.5 0 0 1 7.5 3h9A2.5 2.5 0 0 1 19 5.5v9a2.5 2.5 0 0 1-2.5 2.5H10l-5 4v-5.5A2.5 2.5 0 0 1 5 13V5.5Z" strokeLinejoin="round" />
                 </svg>
+
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-sm font-medium">
                     {chat.title || "New chat"}
@@ -924,12 +1299,14 @@ export default function ChatInterface({ user, onLogout }) {
             <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-sky-100 text-xs font-bold text-sky-700">
               {initials}
             </div>
+
             <div className="min-w-0 flex-1">
               <p className="truncate text-sm font-semibold text-slate-800">
                 {displayName}
               </p>
               <p className="text-xs text-slate-500">Signed in</p>
             </div>
+
             <button
               type="button"
               onClick={onLogout}
@@ -1010,6 +1387,7 @@ export default function ChatInterface({ user, onLogout }) {
                       {user?.email || ""}
                     </p>
                   </div>
+
                   <button
                     type="button"
                     onClick={() => {
@@ -1028,7 +1406,17 @@ export default function ChatInterface({ user, onLogout }) {
         </header>
 
         <div className="relative flex min-h-0 flex-1 flex-col">
-          <div className="flex-1 overflow-y-auto px-3 py-5 sm:px-6 sm:py-7 lg:px-8">
+          <div
+            ref={scrollContainerRef}
+            onScroll={event => {
+              const element = event.currentTarget;
+              const distanceFromBottom =
+                element.scrollHeight - element.scrollTop - element.clientHeight;
+
+              shouldAutoScrollRef.current = distanceFromBottom < 140;
+            }}
+            className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-3 py-5 sm:px-6 sm:py-7 lg:px-8"
+          >
             <div className="mx-auto w-full max-w-6xl">
               {!messages.length ? (
                 <div className="flex min-h-[55vh] flex-col items-center justify-center py-8 text-center">
@@ -1041,6 +1429,7 @@ export default function ChatInterface({ user, onLogout }) {
                   <h2 className="text-2xl font-bold tracking-tight text-slate-900 sm:text-3xl">
                     Let's start a battle
                   </h2>
+
                   <p className="mt-3 max-w-lg text-sm leading-6 text-slate-500">
                     Ask a question or upload a file. Groq and Cohere will generate
                     independent solutions, then an AI judge will compare them.
@@ -1095,9 +1484,91 @@ export default function ChatInterface({ user, onLogout }) {
                               </div>
                             )}
                           </div>
+
                           <p className="mt-1.5 text-right text-[11px] text-slate-400">
                             You
                           </p>
+                        </div>
+                      ) : message.imageGeneration ? (
+                        <div className="min-w-0 space-y-4">
+                          <div className="flex items-center gap-2">
+                            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-violet-100 text-violet-700">
+                              ✦
+                            </div>
+                            <div>
+                              <p className="text-sm font-semibold text-slate-900">
+                                AI Image Generator
+                              </p>
+                              <p className="text-[11px] text-slate-500">
+                                {message.streaming
+                                  ? "Creating your image..."
+                                  : message.error
+                                    ? "Image generation failed"
+                                    : "Image generated successfully"}
+                              </p>
+                            </div>
+                          </div>
+
+                          {message.streaming && !message.image ? (
+                            <div
+                              className="flex min-h-64 flex-col items-center justify-center gap-4 rounded-2xl border border-violet-100 bg-gradient-to-br from-violet-50 via-white to-sky-50 p-8 text-center sm:min-h-80"
+                              role="status"
+                            >
+                              <div className="relative flex h-16 w-16 items-center justify-center">
+                                <span className="absolute inset-0 animate-ping rounded-2xl bg-violet-200/70" />
+                                <span className="absolute inset-1 animate-spin rounded-2xl border-2 border-violet-200 border-t-violet-600" />
+                                <span className="relative text-2xl text-violet-600">
+                                  ✦
+                                </span>
+                              </div>
+
+                              <div>
+                                <p className="text-sm font-semibold text-slate-800">
+                                  Bringing your idea to life
+                                </p>
+                                <p className="mt-1 text-xs text-slate-500">
+                                  The image model is creating a new image from your prompt.
+                                </p>
+                              </div>
+
+                              <div className="flex w-full max-w-xs gap-1.5" aria-hidden="true">
+                                <span className="h-1.5 flex-1 animate-pulse rounded-full bg-violet-200" />
+                                <span className="h-1.5 flex-1 animate-pulse rounded-full bg-violet-300 [animation-delay:150ms]" />
+                                <span className="h-1.5 flex-1 animate-pulse rounded-full bg-sky-300 [animation-delay:300ms]" />
+                              </div>
+                            </div>
+                          ) : message.image ? (
+                            <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+                              <img
+                                src={message.image}
+                                alt={message.prompt || "AI generated result"}
+                                className="h-auto max-h-[720px] w-full rounded-xl object-contain"
+                              />
+
+                              <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+                                <p className="text-xs text-slate-500">
+                                  Generated from your prompt
+                                </p>
+                                <a
+                                  href={message.image}
+                                  download="battle-ai-arena-image.jpg"
+                                  className="rounded-lg bg-sky-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-sky-700"
+                                >
+                                  Download image
+                                </a>
+                              </div>
+                            </div>
+                          ) : message.imageLoadError ? (
+                            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                              This image could not be loaded. Check your connection and refresh the conversation.
+                            </div>
+                          ) : null}
+
+                          {message.error && (
+                            <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+                              {message.error}
+                            </div>
+                          )}
                         </div>
                       ) : (
                         <div className="min-w-0 space-y-4">
@@ -1107,6 +1578,7 @@ export default function ChatInterface({ user, onLogout }) {
                                 <path d="M12 3 14.3 9.7 21 12l-6.7 2.3L12 21l-2.3-6.7L3 12l6.7-2.3L12 3Z" strokeLinejoin="round" />
                               </svg>
                             </div>
+
                             <div>
                               <p className="text-sm font-semibold text-slate-900">
                                 Battle AI Arena
@@ -1145,17 +1617,14 @@ export default function ChatInterface({ user, onLogout }) {
                             !message.solution_1 &&
                             !message.solution_2 && <LoadingDots />}
 
-                          {message.judge && (
-                            <JudgeSection judge={message.judge} />
+                          {message.streaming && !message.judge && (
+                            <JudgeThinking
+                              ready={Boolean(message.solution_1 && message.solution_2)}
+                            />
                           )}
 
-                          {message.streaming && !message.judge && (
-                            <div className="flex items-center gap-2 px-1 text-xs text-slate-500">
-                              <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
-                              {message.solution_1 && message.solution_2
-                                ? "Both solutions are ready. The judge is evaluating them..."
-                                : "Solutions are streaming independently..."}
-                            </div>
+                          {message.judge && (
+                            <JudgeSection judge={message.judge} />
                           )}
 
                           {message.error && (
@@ -1168,8 +1637,6 @@ export default function ChatInterface({ user, onLogout }) {
                       )}
                     </article>
                   ))}
-
-                  <div ref={bottomRef} />
                 </div>
               )}
             </div>
@@ -1217,7 +1684,7 @@ export default function ChatInterface({ user, onLogout }) {
                     event.target.style.height = `${Math.min(event.target.scrollHeight, 180)}px`;
                   }}
                   onKeyDown={handleComposerKeyDown}
-                  placeholder="Message Battle AI Arena..."
+                  placeholder={imageMode ? "Describe the image you want to create..." : "Message Battle AI Arena..."}
                   rows={1}
                   disabled={busy}
                   className="max-h-[180px] min-h-[54px] w-full resize-none bg-transparent px-4 pb-2 pt-4 text-sm leading-6 text-slate-800 outline-none placeholder:text-slate-400 disabled:opacity-60 sm:px-5"
@@ -1225,6 +1692,20 @@ export default function ChatInterface({ user, onLogout }) {
 
                 <div className="flex items-center justify-between gap-3 px-3 pb-3 sm:px-4">
                   <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setImageMode(value => !value);
+                        setError("");
+                      }}
+                      disabled={busy}
+                      className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold transition sm:text-sm ${imageMode ? "border-violet-300 bg-violet-50 text-violet-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"} disabled:opacity-40`}
+                      aria-pressed={imageMode}
+                    >
+                      <span>✦</span>
+                      <span>{imageMode ? "Image mode on" : "Generate image"}</span>
+                    </button>
+
                     <input
                       ref={fileInputRef}
                       type="file"
@@ -1257,7 +1738,7 @@ export default function ChatInterface({ user, onLogout }) {
 
                   <button
                     type="submit"
-                    disabled={busy || (!input.trim() && files.length === 0)}
+                    disabled={busy || (!input.trim() && (imageMode || files.length === 0))}
                     className="flex h-10 items-center gap-2 rounded-xl bg-sky-600 px-4 text-sm font-semibold text-white transition hover:bg-sky-700 disabled:cursor-not-allowed disabled:bg-slate-300"
                   >
                     {busy ? (
@@ -1267,7 +1748,7 @@ export default function ChatInterface({ user, onLogout }) {
                       </>
                     ) : (
                       <>
-                        <span>Send</span>
+                        <span>{imageMode ? "Create image" : "Send"}</span>
                         <svg viewBox="0 0 24 24" fill="none" className="h-4 w-4" stroke="currentColor" strokeWidth="2">
                           <path d="M5 12h14m-6-6 6 6-6 6" strokeLinecap="round" strokeLinejoin="round" />
                         </svg>
@@ -1278,7 +1759,9 @@ export default function ChatInterface({ user, onLogout }) {
               </form>
 
               <p className="mt-2 text-center text-[10px] leading-4 text-slate-400 sm:text-xs">
-                AI-generated answers can contain mistakes. Compare both solutions and review the judge's reasoning.
+                {imageMode
+                  ? "Describe the image clearly. Your prompt will be sent to the image-generation model."
+                  : "AI-generated answers can contain mistakes. Compare both solutions and review the judge's reasoning."}
               </p>
             </div>
           </div>

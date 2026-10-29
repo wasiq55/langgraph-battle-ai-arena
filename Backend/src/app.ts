@@ -28,6 +28,9 @@ import Question from "./models/Question.js";
 import User from "./models/User.js";
 import type { AuthenticatedRequest } from "./middleware/auth.js";
 
+import imageRoutes from "./routes/image.routes.js";
+
+
 const app = express();
 
 const allowedOrigins = [
@@ -56,6 +59,9 @@ app.use(cors({
 app.use(express.json({ limit: "2mb" }));
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
+
+app.use("/api/images", imageRoutes);
+
 
 
 app.get("/api/conversations", requireAuth, async (req, res) => {
